@@ -1,0 +1,65 @@
+databases:
+  - name: salon-system-db
+    plan: free
+    databaseName: salon_system
+    user: salon_system
+
+services:
+  # ------------------------------------------------------------------
+  # Backend — Express + Prisma + Socket.IO
+  # ------------------------------------------------------------------
+  - type: web
+    name: salon-system-backend
+    runtime: node
+    plan: free
+    rootDir: backend
+    buildCommand: npm install && npx prisma generate && npx prisma migrate deploy
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: salon-system-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 5001
+      - key: CLIENT_ORIGIN
+        fromService:
+          type: web
+          name: salon-system-frontend
+          property: host
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        value: mailto:admin@example.com
+
+  # ------------------------------------------------------------------
+  # Frontend — Next.js
+  # ------------------------------------------------------------------
+  - type: web
+    name: salon-system-frontend
+    runtime: node
+    plan: free
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NEXT_PUBLIC_API_URL
+        fromService:
+          type: web
+          name: salon-system-backend
+          property: host
+        # Render only gives you the bare host via fromService, so after the
+        # first deploy, edit this in the dashboard to the full URL, e.g.
+        # https://salon-system-backend.onrender.com/api
+      - key: NEXT_PUBLIC_SOCKET_URL
+        fromService:
+          type: web
+          name: salon-system-backend
+          property: host
