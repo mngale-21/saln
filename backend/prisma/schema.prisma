@@ -1,0 +1,456 @@
+// ============================================================================
+// Prisma Schema — "Salon System" Management System
+// Database: PostgreSQL
+// ============================================================================
+// Run `npx prisma migrate dev --name init` after configuring DATABASE_URL
+// in backend/.env to create these tables in your PostgreSQL database.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// ENUMS
+// ----------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  CASHIER
+  STAFF
+}
+
+enum RoomStatus {
+  AVAILABLE   // normal — its individual services are booked/freed independently
+  MAINTENANCE // admin has taken the whole room offline; no service in it can be booked
+}
+
+// The full lifecycle of a Session, driven entirely by server-side absolute
+// timestamps (never by client-side elapsed counters) so that a staff member
+// or cashier logging out and back in never pauses or resets a timer.
+enum SessionStatus {
+  PENDING_ARRIVAL   // cashier registered the customer + payment confirmed; 10-min "walking to room" countdown running
+  ON_HOLD           // more than 10 minutes late — room/staff slot released back to Free; waiting for the customer
+  ACTIVE            // staff confirmed arrival (or hold was cleared); the service duration timer is running
+  AWAITING_CASHIER  // staff requested an additional service; cashier must confirm + take payment
+  COMPLETED         // service finished (naturally or ended early)
+  CANCELLED         // a person (cashier/staff/admin) actively cancelled it before it started
+  EXPIRED           // an on-hold booking that was never cleared either — auto-closed after a longer grace period
+}
+
+enum PaymentStatus {
+  UNPAID
+  PAID
+  PARTIAL
+  REFUNDED
+}
+
+enum NotificationType {
+  DELAYED_SERVICE
+  SESSION_ON_HOLD
+  SESSION_HOLD_CLEARED
+  ADDITIONAL_SERVICE_REQUEST
+  SESSION_ENDED_EARLY
+  SESSION_CANCELLED
+  SESSION_EXPIRED
+  SERVICE_TIME_FINISHED
+  PAYMENT_DUE
+  REFUND_ISSUED
+  GENERAL
+}
+
+// ----------------------------------------------------------------------------
+// MODELS
+// ----------------------------------------------------------------------------
+
+// A physical salon location. Every branch-scoped resource (rooms, services,
+// sessions, transactions, staff) carries a branchId foreign key so data is
+// always filtered to the branch currently in context.
+model Branch {
+  id        String   @id @default(uuid())
+  name      String   @unique // "Dar es Salaam" | "Dodoma" | "Arusha"
+  code      String   @unique // short code e.g. "DSM", "DOD", "ARS"
+  address   String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users         User[]
+  salonAreas    SalonArea[]
+  customers     Customer[]
+  rooms         Room[]
+  services      Service[]
+  sessions      Session[]
+  transactions  Transaction[]
+  notifications Notification[]
+
+  @@map("branches")
+}
+
+// System user: Admin, Cashier, or Staff.
+model User {
+  id       String @id @default(uuid())
+  username String @unique
+  password String // bcrypt hash — NEVER store plaintext
+
+  firstName String
+  lastName  String // default password source: lowercase(lastName)
+  role      Role   @default(CASHIER)
+
+  // Every non-admin user is tied to a home branch. Cashiers may still switch
+  // their *active* viewing branch client-side via BranchSelector, but this
+  // field represents their assigned/default branch.
+  branchId String?
+  branch   Branch? @relation(fields: [branchId], references: [id])
+
+  // UI language preference — persisted per-user so it follows them across
+  // devices, not just localStorage on one machine.
+  language String @default("en") // "en" | "sw"
+
+  isActive           Boolean   @default(true)
+  mustChangePassword Boolean   @default(true) // true until user changes the auto-generated default
+  lastLoginAt        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessionsStarted Session[]        @relation("SessionStartedBy")
+  sessionsAsStaff Session[]        @relation("SessionStaff")
+  sessionsEnded   Session[]        @relation("SessionEndedBy")
+  sessionsHoldCleared Session[]    @relation("SessionHoldClearedBy")
+  pushSubscriptions PushSubscription[]
+  transactions    Transaction[]    @relation("TransactionCashier")
+  refundsIssued   Transaction[]    @relation("TransactionRefundedBy")
+  roomAssignments RoomAssignment[]
+  notifications   Notification[]
+
+  @@index([branchId])
+  @@map("users")
+}
+
+// A logical area/zone inside a branch (e.g. "Spa Wing", "VIP Suite").
+// Optional grouping layer above individual Rooms.
+model SalonArea {
+  id       String @id @default(uuid())
+  name     String
+  branchId String
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  rooms Room[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([branchId, name])
+  @@index([branchId])
+  @@map("salon_areas")
+}
+
+// A bookable room/station within a branch (and optionally a SalonArea).
+// Every room carries a human-facing roomNumber, plus a roster of
+// (staff, service) assignment pairs. A room is a *space*, not a single
+// bookable slot: it can run several services at once, each with its own
+// staff member and its own independent timer — e.g. Room 2 can have a
+// Massage in progress with Staff A while a Manicure runs at the same time
+// with Staff B. Availability is tracked per (room, service) pair, never
+// per room as a whole. The room's own `status` is only used for an admin
+// "take this whole room offline" maintenance toggle.
+model Room {
+  id         String     @id @default(uuid())
+  roomNumber String // e.g. "R-01", "12" — shown to cashiers/customers
+  name       String // friendly label, e.g. "Room 1"
+  status     RoomStatus @default(AVAILABLE)
+
+  branchId String
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  salonAreaId String?
+  salonArea   SalonArea? @relation(fields: [salonAreaId], references: [id])
+
+  assignments RoomAssignment[]
+  sessions    Session[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([branchId, name])
+  @@unique([branchId, roomNumber])
+  @@index([branchId])
+  @@map("rooms")
+}
+
+// Roster entry: "in Room X, Service Y is delivered by Staff Z".
+// A room may have many of these (one per service offered there), but the
+// same service in the same room can only ever have one staff member.
+model RoomAssignment {
+  id String @id @default(uuid())
+
+  roomId String
+  room   Room   @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  staffId String
+  staff   User   @relation(fields: [staffId], references: [id])
+
+  serviceId String
+  service   Service @relation(fields: [serviceId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([roomId, serviceId])
+  @@index([roomId])
+  @@index([staffId])
+  @@map("room_assignments")
+}
+
+// A service offered at a branch (e.g. "Massage 60min", "Manicure").
+// A service offered at a branch (e.g. "Full Body Massage", "Manicure").
+// `category` is an optional grouping label (e.g. "Massage") so a broad
+// service type can be broken into several priced/timed variants — "Full
+// Body Massage" and "Four-Hand Massage" might both have category
+// "Massage" but their own price and duration. A service with no category
+// is a standalone offering, same as before (e.g. "Haircut").
+model Service {
+  id           String  @id @default(uuid())
+  name         String
+  category     String?
+  price        Decimal @db.Decimal(12, 2)
+  durationMins Int
+
+  branchId String
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  sessions    Session[]
+  assignments RoomAssignment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([branchId, name])
+  @@index([branchId])
+  @@index([branchId, category])
+  @@map("services")
+}
+
+// A single service visit for one customer in one room. The entire timer
+// system is driven by absolute DateTime columns computed once and read
+// back — never by an in-memory counter — so logging out and back in (or
+// a server restart) never pauses, resets, or loses time.
+model Session {
+  id     String        @id @default(uuid())
+  status SessionStatus @default(PENDING_ARRIVAL)
+
+  // Linked once a phone number is given (so repeat visits build real
+  // history); these two stay as a point-in-time snapshot either way, since
+  // a customer's saved name/phone might later be edited.
+  customerId    String?
+  customer      Customer? @relation(fields: [customerId], references: [id])
+  customerName  String?
+  customerPhone String?
+
+  // --- Timer anchor points (all absolute timestamps) ----------------------
+  // Set the moment the cashier registers the customer (payment already
+  // confirmed — see Transaction below) and presses "Start". The countdown
+  // is simply `pendingExpiresAt - now()`, recomputed fresh on every read —
+  // nothing to pause or resume. The window is 10 minutes.
+  registeredAt     DateTime  @default(now())
+  pendingExpiresAt DateTime?
+
+  // Set the moment the 10-minute countdown lapses without confirmation —
+  // this is when the session moves to ON_HOLD and the (room, service) slot
+  // is released back to Free so someone else can be booked into it.
+  holdStartedAt DateTime?
+  // Set the moment a person clears the hold (the customer showed up after
+  // all) and the session resumes — either back in its original room or
+  // reassigned to a different available one. Whoever did it is recorded.
+  holdClearedAt   DateTime?
+  holdClearedById String?
+  holdClearedBy   User?     @relation("SessionHoldClearedBy", fields: [holdClearedById], references: [id])
+
+  // Set the moment arrival is confirmed (directly, or via clearing a hold).
+  // This immediately stops any countdown — however much was left — and
+  // becomes the anchor for the service duration timer.
+  arrivalConfirmedAt DateTime?
+  serviceEndsAt      DateTime?
+
+  endedAt DateTime?
+
+  // Whoever ended/cancelled the session — a Cashier, Staff member, or Admin.
+  // This is what lets a report say exactly who ended a given service.
+  endedById String?
+  endedBy   User?   @relation("SessionEndedBy", fields: [endedById], references: [id])
+
+  // True the moment the 10-minute countdown expires without confirmation
+  // (i.e. the session went ON_HOLD at least once). Sticky — stays true for
+  // reporting even after the hold is later cleared.
+  delayed Boolean @default(false)
+
+  // True if the session was ended before the service's natural duration
+  // elapsed — by a cashier OR a staff member (both are now permitted to end
+  // early). Combined with endedById/endedBy this is exactly what the
+  // "who ended it, and was it early" loss report is built from.
+  endedEarly Boolean @default(false)
+
+  // Set once the "service time finished" alarm has fired for this session,
+  // so the background sweep doesn't re-alert on every pass while a
+  // finished-but-not-yet-ended session sits waiting.
+  finishedAlertSent Boolean @default(false)
+
+  // Chains an additional-service session back to the customer's original
+  // visit, so reports and the staff/cashier UI can group them together.
+  parentSessionId String?
+  parentSession   Session?  @relation("SessionChain", fields: [parentSessionId], references: [id])
+  followUps       Session[] @relation("SessionChain")
+
+  branchId String
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  roomId String
+  room   Room   @relation(fields: [roomId], references: [id])
+
+  serviceId String?
+  service   Service? @relation(fields: [serviceId], references: [id])
+
+  // The staff member responsible for delivering this specific service in
+  // this room (copied in from the RoomAssignment at creation/reassignment
+  // time).
+  staffId String?
+  staff   User?   @relation("SessionStaff", fields: [staffId], references: [id])
+
+  startedById String
+  startedBy   User   @relation("SessionStartedBy", fields: [startedById], references: [id])
+
+  transaction   Transaction?
+  notifications Notification[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([branchId])
+  @@index([roomId])
+  @@index([staffId])
+  @@index([status])
+  @@index([customerId])
+  @@map("sessions")
+}
+
+// A repeat-visit customer directory, matched by phone number within a
+// branch. Built automatically the first time someone registers a customer
+// with a phone number — a walk-in with no phone just stays a name/phone
+// snapshot on the Session and never creates a Customer record, so this
+// stays a real directory of people who can be looked up again rather than
+// filling with one-off anonymous entries.
+model Customer {
+  id    String  @id @default(uuid())
+  name  String
+  phone String
+  email String?
+  notes String?
+
+  branchId String
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  sessions Session[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([branchId, phone])
+  @@index([branchId])
+  @@map("customers")
+}
+
+// Payment record tied 1:1 to a completed Session.
+// Payment record tied 1:1 to a completed Session. status distinguishes
+// money actually received (PAID) from money still owed for a service that
+// was already delivered (UNPAID/PARTIAL — this is the "lost/uncollected
+// funds" category) from money given back after the fact (REFUNDED).
+model Transaction {
+  id     String        @id @default(uuid())
+  amount Decimal       @db.Decimal(12, 2)
+  status PaymentStatus @default(UNPAID)
+  method String? // e.g. "cash", "mobile_money", "card"
+
+  branchId String
+  branch   Branch @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  sessionId String  @unique
+  session   Session @relation(fields: [sessionId], references: [id])
+
+  cashierId String
+  cashier   User   @relation("TransactionCashier", fields: [cashierId], references: [id])
+
+  // Refund trail — who issued it, when, how much, and why. refundAmount can
+  // be less than the original `amount` for a partial refund.
+  refundAmount Decimal?  @db.Decimal(12, 2)
+  refundReason String?
+  refundedAt   DateTime?
+  refundedById String?
+  refundedBy   User?     @relation("TransactionRefundedBy", fields: [refundedById], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([branchId])
+  @@map("transactions")
+}
+
+// Persisted alert/notification, pushed in real time over Socket.IO and also
+// available on-demand (bell icon) so nothing is missed if a device was
+// offline when it fired. Either targeted at one userId, or broadcast to an
+// entire role within a branch (e.g. every cashier at DSM).
+model Notification {
+  id      String           @id @default(uuid())
+  type    NotificationType @default(GENERAL)
+  message String
+
+  branchId String?
+  branch   Branch? @relation(fields: [branchId], references: [id], onDelete: Cascade)
+
+  // Targeted at one specific user...
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id])
+
+  // ...or broadcast to everyone with this role in the branch (used for
+  // "notify the cashier" / "notify the admin" when we don't pin it to one
+  // specific person).
+  targetRole Role?
+
+  sessionId String?
+  session   Session? @relation(fields: [sessionId], references: [id])
+
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([branchId, targetRole])
+  @@map("notifications")
+}
+
+// A browser/device Web Push subscription. This is what lets an alert
+// (delayed service, service time finished, etc.) reach a person's phone or
+// desktop as a real OS-level notification even when they aren't logged
+// into the app right now, and even if the browser tab is closed — Web
+// Push is delivered by the browser's push service directly to the device,
+// independent of our own session/JWT. One user can have several of these
+// (one per device/browser they've enabled notifications on). Logging out
+// of the app does NOT remove these — that's the point.
+model PushSubscription {
+  id       String @id @default(uuid())
+  endpoint String @unique
+  p256dh   String
+  auth     String
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("push_subscriptions")
+}
